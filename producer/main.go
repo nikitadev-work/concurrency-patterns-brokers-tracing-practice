@@ -24,17 +24,15 @@ func sendMessages(ctx context.Context, w *kafka.Writer, done chan int) {
 		default:
 		}
 
-		timestamp := time.Now()
-		value := fmt.Sprintf("%d) New message from producer!", i)
+		value := fmt.Sprintf("New message %d from producer!", i)
 		msg := []byte(value)
 		err := w.WriteMessages(ctx, kafka.Message{
 			Value: msg,
-			Time:  timestamp,
 		})
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("New message with index %d sent!\n", i)
+		fmt.Printf("New message %d sent!\n", i)
 		i++
 		time.Sleep(1 * time.Second)
 	}
