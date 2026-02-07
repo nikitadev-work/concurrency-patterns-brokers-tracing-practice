@@ -1,1 +1,1 @@
-Small Repository for practice different technologies
+A small repository for practicing various technologies
