@@ -1,0 +1,16 @@
+prefix: study
+
+defaults:
+  partitions: 3
+  replicationFactor: 1
+
+topics:
+  - fullName: "{prefix}.main"
+    retentionMs: 604800000
+
+  - fullName: "{prefix}.dlq"
+    retentionMs: -1
+
+retryTopics:
+  delays: [10s, 30s, 2m, 5m, 10m]
+  retentionMs: 600000

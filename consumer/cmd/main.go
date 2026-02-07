@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"os/signal"
 	"strconv"
+	redispkg "study/consumer/internal"
 	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -107,6 +111,50 @@ func readMessages(ctx context.Context, done chan int, r *kafka.Reader, dlqWriter
 	}
 }
 
+func simpleRead(ctx context.Context, done chan int, r *kafka.Reader, rds *redis.Client) {
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("Finished reading messages")
+			done <- 1
+			return
+		default:
+		}
+
+		msg, err := r.FetchMessage(ctx)
+		if err != nil {
+			fmt.Printf("Failed to read message. Error: %s\n", err.Error())
+			continue
+		}
+
+		var eventId string
+		for _, v := range msg.Headers {
+			if v.Key == "event_id" {
+				eventId = string(v.Value)
+			}
+		}
+
+		if eventId == "" {
+			log.Println("Empty event_id")
+		}
+
+		err = redispkg.AddNewKey(ctx, rds, eventId, 1)
+		if err != nil {
+			if errors.Is(err, redispkg.ErrKeyAlreadyExists) {
+				log.Println("Key already exists")
+			}
+		}
+
+		fmt.Printf("Key: %s\nValue: %s\n", string(msg.Key), string(msg.Value))
+
+		err = r.CommitMessages(ctx, msg)
+		if err != nil {
+			log.Println("Commit message error")
+			continue
+		}
+	}
+}
+
 func main() {
 	fmt.Println("Consumer started")
 
@@ -115,41 +163,49 @@ func main() {
 		panic(err)
 	}
 
+	redisAddr := os.Getenv("REDIS_ADDR")
+	rds := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+	defer func() {
+		rds.Close()
+	}()
+
 	broker := os.Getenv("KAFKA_BROKER")
-	topic := os.Getenv("KAFKA_TOPIC")
-	dlqTopik := os.Getenv("KAFKA_DLQ_TOPIC")
 	groupid := "consumer-group-id10"
 
-	baseDelayStr := os.Getenv("KAFKA_BASE_DELAY")
-	baseDelay, err := time.ParseDuration(baseDelayStr)
-	if err != nil {
-		panic(err)
-	}
+	// baseDelayStr := os.Getenv("KAFKA_BASE_DELAY")
+	// baseDelay, err := time.ParseDuration(baseDelayStr)
+	// if err != nil {
+	// 	panic(err)
+	// }
 
+	topic := "study.main"
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:     []string{broker},
-		GroupID:     groupid,
 		Topic:       topic,
+		GroupID:     groupid,
 		StartOffset: kafka.LastOffset,
 	})
 	defer func() {
 		r.Close()
 	}()
 
-	dlqWriter := kafka.NewWriter(kafka.WriterConfig{
-		Brokers: []string{broker},
-		Topic:   dlqTopik,
-	})
-	defer func() {
-		dlqWriter.Close()
-	}()
+	// dlqWriter := kafka.NewWriter(kafka.WriterConfig{
+	// 	Brokers: []string{broker},
+	// 	Topic:   dlqTopik,
+	// })
+	// defer func() {
+	// 	dlqWriter.Close()
+	// }()
 
 	done := make(chan int, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	go readMessages(ctx, done, r, dlqWriter, baseDelay)
+	//go readMessages(ctx, done, r, dlqWriter, baseDelay)
+	go simpleRead(ctx, done, r, rds)
 
 	<-sigCh
 	cancel()
