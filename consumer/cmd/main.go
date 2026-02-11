@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,109 +13,87 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.25.0"
+	"go.opentelemetry.io/otel/trace"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"log/slog"
+
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 )
 
-func readMessages(ctx context.Context, done chan int, r *kafka.Reader, dlqWriter *kafka.Writer, baseDelay time.Duration) {
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("Finished reading messages")
-			done <- 1
-			return
-		default:
-		}
+var (
+	processedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "consumer_processed_total",
+		Help: "Total number of successfully processed messages (committed).",
+	})
 
-		msg, err := r.FetchMessage(ctx)
-		if err != nil {
-			fmt.Printf("Failed to read message. Error: %s\n", err.Error())
-			continue
-		}
+	errorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "consumer_errors_total",
+		Help: "Total number of processing errors.",
+	})
 
-		v := rand.Float32()
-		processed := false
-		dlqed := false
-		for _, h := range msg.Headers {
-			if h.Key == "replayed" && string(h.Value) == "true" {
-				v = 1
-			}
-		}
-		if v <= 0.8 {
-			fmt.Println("ERROR!!!")
+	processingSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "consumer_processing_seconds",
+		Help:    "Message processing time in seconds.",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+	})
 
-			// retry for 5 times
-			for i := 1; i <= 5; i++ {
-				// backoff + jitter
-				delay := baseDelay << (i - 1)
-				jitter := time.Duration(rand.Int63n(int64(delay / 2)))
-				delay += jitter
-				timer := time.NewTimer(delay)
+	messageAge = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "consumer_message_age_seconds",
+		Help:    "Message age in seconds.",
+		Buckets: []float64{0.5, 1, 2, 5, 10, 30, 60, 300},
+	})
+)
 
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					fmt.Println("Finishing retries and stopping reading process")
-					done <- 1
-					return
-				case <-timer.C:
-				}
-
-				newVal := rand.Float32()
-				if newVal <= 0.8 {
-					fmt.Printf("Attempt %d to retry failed!\n", i)
-					if i == 5 {
-						fmt.Printf("All 5 attempts were failed! Sending message to DLQ!\n")
-						err := dlqWriter.WriteMessages(ctx, kafka.Message{
-							Value: []byte(msg.Value),
-							Headers: []kafka.Header{
-								{Key: "original_topic", Value: []byte(msg.Topic)},
-								{Key: "original_partition", Value: []byte(strconv.Itoa(msg.Partition))},
-								{Key: "original_offset", Value: []byte(strconv.FormatInt(msg.Offset, 10))},
-								{Key: "attempts", Value: []byte(strconv.Itoa(i))},
-								{Key: "failed_at", Value: []byte(time.Now().Format(time.RFC3339))},
-							},
-						})
-						if err != nil {
-							fmt.Println("Failed to write message to DLQ!")
-							break
-						}
-						fmt.Printf("Message sent to DLQ: %s", string(msg.Value))
-						dlqed = true
-						break
-					}
-					continue
-				}
-
-				fmt.Printf("Successful attempt to retry %d\n", i)
-				processed = true
-				break
-			}
-		} else {
-			processed = true
-		}
-
-		if processed {
-			fmt.Printf("%s\n", string(msg.Value))
-		}
-
-		if processed || dlqed {
-			err := r.CommitMessages(ctx, msg)
-			if err != nil {
-				fmt.Println("Failed to commit message")
-				continue
-			}
-			fmt.Printf("Message committed\n\n")
-		}
-	}
+type kafkaHeaderCarrier struct {
+	headers *[]kafka.Header
 }
 
-func simpleRead(ctx context.Context, done chan int, r *kafka.Reader, rds *redis.Client) {
+func (c kafkaHeaderCarrier) Get(key string) string {
+	for _, h := range *c.headers {
+		if h.Key == key {
+			return string(h.Value)
+		}
+	}
+	return ""
+}
+
+func (c kafkaHeaderCarrier) Set(key, val string) {
+	*c.headers = append(*c.headers, kafka.Header{
+		Key:   key,
+		Value: []byte(val),
+	})
+}
+
+func (c kafkaHeaderCarrier) Keys() []string {
+	keys := make([]string, 0, len(*c.headers))
+	for _, h := range *c.headers {
+		keys = append(keys, h.Key)
+	}
+	return keys
+}
+
+func simpleRead(ctx context.Context, done chan int, r *kafka.Reader, rds *redis.Client, logger *slog.Logger) {
+	tr := otel.Tracer("consumer")
+
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("Finished reading messages")
+			logger.Info("shutdown: stop reading")
 			done <- 1
 			return
 		default:
@@ -123,36 +101,139 @@ func simpleRead(ctx context.Context, done chan int, r *kafka.Reader, rds *redis.
 
 		msg, err := r.FetchMessage(ctx)
 		if err != nil {
-			fmt.Printf("Failed to read message. Error: %s\n", err.Error())
+			logger.Error("Failed to read message.")
 			continue
 		}
 
+		var traceId string
+
+		for _, v := range msg.Headers {
+			if v.Key == "trace_id" {
+				traceId = string(v.Value)
+			}
+		}
+
+		var ctxMsg context.Context
+		var span trace.Span
+
+		if traceId != "" {
+			tid, err := trace.TraceIDFromHex(traceId)
+			if err == nil {
+				sc := trace.NewSpanContext(trace.SpanContextConfig{
+					TraceID: tid,
+					Remote:  true,
+				})
+				parentCtx := trace.ContextWithRemoteSpanContext(ctx, sc)
+				ctxMsg, span = tr.Start(parentCtx, "consume_message")
+				logger.Info("CONSUMER trace_id", "trace_id", span.SpanContext().TraceID().String())
+			} else {
+				ctxMsg, span = tr.Start(ctx, "consume_message")
+			}
+		} else {
+			ctxMsg, span = tr.Start(ctx, "consume_message")
+		}
+
+		span.SetAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination", msg.Topic),
+			attribute.Int64("messaging.kafka.partition", int64(msg.Partition)),
+			attribute.Int64("messaging.kafka.message.offset", msg.Offset),
+		)
+
+		start := time.Now()
+
 		var eventId string
+		var createdAt int64
+
 		for _, v := range msg.Headers {
 			if v.Key == "event_id" {
 				eventId = string(v.Value)
 			}
-		}
-
-		if eventId == "" {
-			log.Println("Empty event_id")
-		}
-
-		err = redispkg.AddNewKey(ctx, rds, eventId, 1)
-		if err != nil {
-			if errors.Is(err, redispkg.ErrKeyAlreadyExists) {
-				log.Println("Key already exists")
+			if v.Key == "created_at" {
+				createdAt, _ = strconv.ParseInt(string(v.Value), 10, 64)
 			}
 		}
 
-		fmt.Printf("Key: %s\nValue: %s\n", string(msg.Key), string(msg.Value))
-
-		err = r.CommitMessages(ctx, msg)
-		if err != nil {
-			log.Println("Commit message error")
+		if eventId == "" {
+			logger.Error("Empty event_id")
+			span.RecordError(errors.New("empty event_id"))
+			span.End()
 			continue
 		}
+
+		age := float64(time.Now().UnixMilli()-createdAt) / 1000.0
+
+		err = redispkg.AddNewKey(ctxMsg, rds, eventId, 1)
+		if err != nil {
+			if errors.Is(err, redispkg.ErrKeyAlreadyExists) {
+				logger.Info("dedup hit: skip side-effect")
+			} else {
+				errorsTotal.Inc()
+				span.RecordError(err)
+				span.End()
+				continue
+			}
+		}
+
+		t := time.NewTimer(1 * time.Second)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			done <- 1
+			log.Println("Got exit signal. Stopping...")
+		case <-t.C:
+		}
+
+		err = r.CommitMessages(ctxMsg, msg)
+		if err != nil {
+			logger.Info("Commit message error")
+			span.RecordError(err)
+			span.End()
+			continue
+		}
+
+		processingSeconds.Observe(time.Since(start).Seconds())
+		messageAge.Observe(age)
+		processedTotal.Inc()
+
+		span.End()
 	}
+
+}
+
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "localhost:4317"
+	}
+
+	exp, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(endpoint),
+		otlptracegrpc.WithInsecure(),
+		otlptracegrpc.WithDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			semconv.ServiceName("consumer"),
+			attribute.String("env", "local"),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+
+	otel.SetTracerProvider(tp)
+	return tp, nil
 }
 
 func main() {
@@ -162,6 +243,13 @@ func main() {
 		fmt.Println("Failed to load .env")
 		panic(err)
 	}
+
+	l := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	l = l.With("service", "consumer")
+	l.Info("starting")
 
 	redisAddr := os.Getenv("REDIS_ADDR")
 	rds := redis.NewClient(&redis.Options{
@@ -174,12 +262,6 @@ func main() {
 	broker := os.Getenv("KAFKA_BROKER")
 	groupid := "consumer-group-id10"
 
-	// baseDelayStr := os.Getenv("KAFKA_BASE_DELAY")
-	// baseDelay, err := time.ParseDuration(baseDelayStr)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
 	topic := "study.main"
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:     []string{broker},
@@ -191,25 +273,41 @@ func main() {
 		r.Close()
 	}()
 
-	// dlqWriter := kafka.NewWriter(kafka.WriterConfig{
-	// 	Brokers: []string{broker},
-	// 	Topic:   dlqTopik,
-	// })
-	// defer func() {
-	// 	dlqWriter.Close()
-	// }()
-
 	done := make(chan int, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	//go readMessages(ctx, done, r, dlqWriter, baseDelay)
-	go simpleRead(ctx, done, r, rds)
+	tp, err := initTracer(ctx)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tp.Shutdown(c)
+	}()
+
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+
+		addr := ":2112"
+		fmt.Println("metrics listening on", addr)
+		l.Info("metrics listening", "addr", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			fmt.Println("metrix server error", err)
+		}
+	}()
+
+	go simpleRead(ctx, done, r, rds, l)
 
 	<-sigCh
+	l.Info("shutdown: signal received")
 	cancel()
 
 	<-done
-	fmt.Print("Stopped consumer")
+	l.Info("stopped")
 }

@@ -9,12 +9,57 @@ import (
 	"strconv"
 	"study/outbox-worker/internal"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx"
 	"github.com/joho/godotenv"
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.25.0"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"gopkg.in/yaml.v3"
 )
+
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "localhost:4317"
+	}
+
+	exp, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(endpoint),
+		otlptracegrpc.WithInsecure(),
+		otlptracegrpc.WithDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			semconv.ServiceName("outbox-worker"),
+			attribute.String("env", "local"),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+
+	otel.SetTracerProvider(tp)
+	return tp, nil
+}
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -22,7 +67,18 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	err := godotenv.Load()
+	tp, err := initTracer(ctx)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tp.Shutdown(c)
+	}()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	err = godotenv.Load()
 	if err != nil {
 		fmt.Println("Failed to load .env")
 		panic(err)
@@ -82,9 +138,9 @@ func main() {
 	log.Println("Outbox worker started")
 	go internal.Work(db, done, ctx, w)
 
-	<- sigCh
+	<-sigCh
 	cancel()
 
-	<- done
+	<-done
 	log.Println("Outbox worker finished")
 }

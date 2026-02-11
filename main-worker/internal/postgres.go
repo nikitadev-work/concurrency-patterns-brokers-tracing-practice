@@ -3,7 +3,6 @@ package postgrespkg
 import (
 	"context"
 	"log"
-	"time"
 
 	"encoding/json"
 
@@ -106,15 +105,15 @@ func AddNewLine(done chan int, ctx context.Context, db *pgx.Conn) {
 			return
 		}
 
-		t := time.NewTimer(2 * time.Second)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			done <- 1
-			log.Println("Context finished, stopping...")
-			return
-		case <-t.C:
-		}
+		// t := time.NewTimer(1 * time.Second)
+		// select {
+		// case <-ctx.Done():
+		// 	t.Stop()
+		// 	done <- 1
+		// 	log.Println("Context finished, stopping...")
+		// 	return
+		// case <-t.C:
+		// }
 		i++
 	}
 }

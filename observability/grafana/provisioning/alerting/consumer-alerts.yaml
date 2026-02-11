@@ -1,0 +1,80 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: consumer-basic
+    folder: Observability
+    interval: 10s
+
+    rules:
+      - uid: consumer-down
+        title: ConsumerDown
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              editorMode: code
+              expr: max(up{job="consumer"}) < 1
+              instant: true
+              range: false
+              refId: A
+        for: 20s
+        noDataState: Alerting
+        execErrState: Alerting
+        annotations:
+          summary: "consumer target is down"
+        labels:
+          severity: critical
+        isPaused: false
+
+      - uid: consumer-metrics-missing
+        title: MetricsMissing
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 120
+              to: 0
+            datasourceUid: prometheus
+            model:
+              editorMode: code
+              expr: (max(absent(consumer_processed_total)) or vector(0)) > 0
+              instant: true
+              range: false
+              refId: A
+        for: 20s
+        noDataState: Alerting
+        execErrState: Alerting
+        annotations:
+          summary: "consumer metrics missing"
+        labels:
+          severity: critical
+        isPaused: false
+
+      - uid: consumer-no-processing
+        title: NoProcessingWhileUp
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              editorMode: code
+              expr: (rate(consumer_processed_total[5m]) < 0.3) and (max(up{job="consumer"}) == 1)
+              instant: true
+              range: false
+              refId: A
+        for: 30s
+        noDataState: OK
+        execErrState: Alerting
+        annotations:
+          summary: "consumer is up but not processing"
+        labels:
+          severity: warning
+        isPaused: false

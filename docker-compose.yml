@@ -43,5 +43,33 @@ services:
       timeout: 3s
       retries: 10
 
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    ports:
+      - "16686:16686"   # UI
+      - "4317:4317"     # OTLP gRPC (для OTel)
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+
 volumes:
   pg_data:

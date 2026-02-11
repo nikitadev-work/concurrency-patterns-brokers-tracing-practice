@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx"
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type OutboxModel struct {
@@ -20,6 +22,8 @@ type OutboxModel struct {
 }
 
 func Work(db *pgx.Conn, done chan int, ctx context.Context, w *kafka.Writer) error {
+	tr := otel.Tracer("outbox-worker")
+
 	for {
 		tx, err := db.Begin()
 		if err != nil {
@@ -85,7 +89,19 @@ func Work(db *pgx.Conn, done chan int, ctx context.Context, w *kafka.Writer) err
 			}
 
 			for _, r := range res {
-				err := w.WriteMessages(ctx, kafka.Message{
+				ctxMsg, span := tr.Start(ctx, "outbox_publish")
+				traceId := span.SpanContext().TraceID().String()
+				log.Println("OUTBOX trace_id:", traceId)
+
+				span.SetAttributes(
+					attribute.String("messaging.system", "kafka"),
+					attribute.String("event.id", strconv.FormatInt(r.Id, 10)),
+					attribute.String("event.type", r.EventType),
+					attribute.String("aggregate.type", r.AggregateType),
+					attribute.String("aggregate.id", r.AggregateId.String()),
+				)
+
+				err := w.WriteMessages(ctxMsg, kafka.Message{
 					Key:   []byte(r.AggregateId.String()),
 					Value: r.Payload,
 					Headers: []kafka.Header{
@@ -93,16 +109,26 @@ func Work(db *pgx.Conn, done chan int, ctx context.Context, w *kafka.Writer) err
 							Key:   "event_id",
 							Value: []byte(strconv.FormatInt(r.Id, 10)),
 						},
+						{
+							Key:   "created_at",
+							Value: []byte(strconv.FormatInt(time.Now().UnixMilli(), 10)),
+						},
+						{
+							Key: "trace_id", Value: []byte(traceId),
+						},
 					},
 				})
 				if err != nil {
 					log.Println("Write message error")
+					span.RecordError(err)
+					span.End()
 					_, err = db.Exec(
 						"UPDATE outbox SET status = 'NEW' WHERE id = $1",
 						r.Id,
 					)
 					log.Println("Status NEW returned")
 					done <- 1
+					span.End()
 					return err
 				}
 
@@ -115,8 +141,10 @@ func Work(db *pgx.Conn, done chan int, ctx context.Context, w *kafka.Writer) err
 				if err != nil {
 					log.Println("Update status error")
 					done <- 1
+					span.End()
 					return err
 				}
+				span.End()
 			}
 		} else {
 			err = tx.Commit()

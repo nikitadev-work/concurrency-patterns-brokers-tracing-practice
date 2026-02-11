@@ -10,6 +10,7 @@ dev-down:
 	docker container prune -f
 
 migrate-up:
+	@set -a; . ./.env; set +a; \
 	migrate -path $(MIGRATION_DIR) -database "$(DB_URL)" up
 
 migrate-down:
