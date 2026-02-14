@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-http
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: simple-http
+  template:
+    metadata:
+      labels:
+        app: simple-http
+    spec:
+      containers:
+        - name: app
+          image: simple-http:2
+          env:
+            - name: APP_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: simple-http-config
+                  key: APP_ENV
+            - name: APP_MESSAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: simple-http-config
+                  key: APP_MESSAGE
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: simple-http-secret
+                  key: API_TOKEN
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
