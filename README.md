@@ -1,3 +1,8 @@
-A small repository for practicing various technologies
+### Список практик по веткам:
 
-New technology -> new branch
+*   **Kafka / RabbitMQ**: отправка сообщений и работа с ошибками (dlq).
+*   **Kubernetes**: запуск сервисов в кластере.
+*   **OpenTelemetry / Jaeger**: поиск ошибок в полном пути запроса.
+*   **Alerts**: настройка уведомлений о сбоях.
+*   **Outbox**: надежное сохранение данных перед отправкой в очередь.
+*   **pprof**: анализ производительности кода на Go.
